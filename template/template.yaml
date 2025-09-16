@@ -211,9 +211,9 @@ Resources:
             - !Sub '.amazonaws.com/${StackName}-repository:latest'
         Vcpus: 4
         Memory: 16384
-        Gpu:
-          - Type: nvidia-tesla-k80
-            Value: 1
+        ResourceRequirements:
+          - Type: GPU
+            Value: "1"
         JobRoleArn:  !GetAtt 'BatchTaskExecutionRole.Arn'
         ExecutionRoleArn:  !GetAtt 'BatchTaskExecutionRole.Arn'
         LogConfiguration:
