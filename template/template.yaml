@@ -1,0 +1,589 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Protein Binder Generation Pipeline with AWS Batch on GPU-enabled EC2 using CloudFormation'
+Parameters:
+  StackName:
+    Type: String
+    #Default: protein-binder-pipeline
+    Description: The name of the protein binder generation pipeline stack
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  NATEIP:
+    DependsOn: VPCGatewayAttachment
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  NATGateway:
+      DependsOn: VPCGatewayAttachment
+      Type: AWS::EC2::NatGateway
+      Properties:
+        AllocationId:
+          Fn::GetAtt:
+          - NATEIP
+          - AllocationId
+        SubnetId:
+          Ref: PublicSubnet
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Security Group for instances launched in the VPC by Batch
+      VpcId:
+        Ref: VPC
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId:
+        Ref: VPC
+      MapPublicIpOnLaunch: 'True'
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName} Public Subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName} Private Subnet
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName} Public Route
+        - Key: Project
+          Value: AWS Batch in Fargate
+  PublicSubnetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId:
+        Ref: PublicSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet
+      RouteTableId:
+        Ref: PublicSubnetRouteTable
+  PrivateSubnetRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId:
+          Ref: VPC
+        Tags:
+          - Key: Name
+            Value: !Sub ${StackName} Private Route
+          - Key: Project
+            Value: AWS Batch in Fargate
+  PrivateSubnetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref 'PrivateSubnetRouteTable'
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: NATGateway
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateSubnet
+      RouteTableId:
+        Ref: PrivateSubnetRouteTable
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${StackName}-lambda-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AWSBatchFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+      Path: /
+      Policies:
+      - PolicyName: !Sub ${StackName}-lambda-s3-dynamo-policy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - 's3:Get*'
+              - 's3:List*'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Sub "${StackName}-${AWS::AccountId}"
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Sub "${StackName}-${AWS::AccountId}"
+                  - /*
+          - Effect: Allow
+            Action:
+              - 'dynamodb:PutItem'
+              - 'dynamodb:UpdateItem'
+              - 'dynamodb:GetItem'
+            Resource: !Join
+              - ''
+              - - 'arn:aws:dynamodb:'
+                - !Sub "${AWS::Region}:${AWS::AccountId}:table/${StackName}-jobs"
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: batch.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  BatchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  BatchInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref BatchInstanceRole
+
+  BatchProcessingJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      PropagateTags: true
+      JobDefinitionName: !Sub ${StackName}-JobDefinition
+      ContainerProperties:
+        Image:
+          Fn::Join:
+          - ''
+          - - Ref: AWS::AccountId
+            - .dkr.ecr.
+            - Ref: AWS::Region
+            - !Sub '.amazonaws.com/${StackName}-repository:latest'
+        Vcpus: 4
+        Memory: 16384
+        Gpu:
+          - Type: nvidia-tesla-k80
+            Value: 1
+        JobRoleArn:  !GetAtt 'BatchTaskExecutionRole.Arn'
+        ExecutionRoleArn:  !GetAtt 'BatchTaskExecutionRole.Arn'
+        LogConfiguration:
+          LogDriver:  awslogs
+          Options:
+            awslogs-group: !Ref 'BatchLogGroup'
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: !Sub ${StackName}-logs
+        Command:
+        - python
+        - entrypoint.py
+      PlatformCapabilities:
+      - EC2
+      Tags:
+        Service: Batch
+        Name: JobDefinitionTag
+        Expected: MergeTag
+
+  BatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub ${StackName}-awslogs
+      RetentionInDays: 7
+  BatchTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${StackName}-taskexec-role
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+              Resource: '*'
+        - PolicyName: !Sub ${StackName}-ecs-task-s3-get-policy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:ListBucket
+                - s3:GetBucketLocation
+                - s3:HeadBucket
+              Resource:
+                - !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Sub "${StackName}-${AWS::AccountId}"
+                - !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Sub "${StackName}-${AWS::AccountId}"
+                    - /*
+        - PolicyName: !Sub ${StackName}-ecs-task-dynamo-policy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - 'dynamodb:PutItem'
+                - 'dynamodb:UpdateItem'
+                - 'dynamodb:GetItem'
+                - 'dynamodb:DescribeTable'
+                - 'dynamodb:Query'
+                - 'dynamodb:Scan'
+              Resource:
+                - !Join
+                  - ''
+                  - - 'arn:aws:dynamodb:'
+                    - !Sub "${AWS::Region}:${AWS::AccountId}:table/${StackName}-jobs"
+                - !Join
+                  - ''
+                  - - 'arn:aws:dynamodb:'
+                    - !Sub "${AWS::Region}:${AWS::AccountId}:table/${StackName}-jobs/index/*"
+
+  BatchProcessingJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub "${StackName}-queue"
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+      - Order: 1
+        ComputeEnvironment:
+          Ref: ComputeEnvironment
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        MaxvCpus: 10
+        DesiredvCpus: 0
+        InstanceTypes:
+          - p3.2xlarge
+          - g4dn.xlarge
+          - p2.xlarge
+        Subnets:
+        - Ref: PrivateSubnet
+        SecurityGroupIds:
+        - Ref: SecurityGroup
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+      ServiceRole:
+        Ref: BatchServiceRole
+  BatchProcessS3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: BatchProcessBucketPermission
+    Properties:
+      BucketName:
+          !Sub '${StackName}-${AWS::AccountId}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:*'
+          Function: !GetAtt BatchProcessingLambdaInvokeFunction.Arn
+          Filter:
+            S3Key:
+              Rules:
+                - Name: prefix
+                  Value: targets/
+                - Name: suffix
+                  Value: .pdb
+  BatchProcessBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref BatchProcessingLambdaInvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:aws:s3:::${StackName}-${AWS::AccountId}"
+  BatchProcessingLambdaInvokeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackName}-lambda"
+      Description: Python Function Handler that would be triggered BY s3 events TO the aws batch
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          BATCH_JOB_QUEUE_NAME: !Sub "${StackName}-queue"
+          JOBS_TABLE_NAME: !Sub ${StackName}-jobs
+          JOB_DEFINITION_NAME: !Sub ${StackName}-JobDefinition
+      Role:
+        Fn::GetAtt:
+          - LambdaExecutionRole
+          - Arn
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  inputFileName = ""
+                  bucketName = ""
+
+                  for record in event['Records']:
+                    bucketName = record['s3']['bucket']['name']
+                    inputFileName = record['s3']['object']['key']
+
+                  # Extract PDB filename (remove targets/ prefix and .pdb extension)
+                  pdb_name = inputFileName.replace('targets/', '').replace('.pdb', '')
+                  job_id = str(uuid.uuid4())
+
+                  print(f"Processing: {inputFileName} -> job_id: {job_id}")
+
+                  # Create job record in DynamoDB
+                  dynamodb = boto3.resource('dynamodb')
+                  jobs_table = dynamodb.Table(os.environ["JOBS_TABLE_NAME"])
+
+                  jobs_table.put_item(
+                      Item={
+                          'job_id': job_id,
+                          'status': 'PENDING',
+                          'input_s3': f's3://{bucketName}/{inputFileName}',
+                          'output_s3': f's3://{bucketName}/results/{job_id}/',
+                          'pdb_name': pdb_name,
+                          'submitted_at': datetime.utcnow().isoformat()
+                      }
+                  )
+                  print(f"Created DynamoDB record for job: {job_id}")
+
+                  batch = boto3.client('batch')
+                  batch_job_queue_name = os.environ["BATCH_JOB_QUEUE_NAME"]
+
+                  print(f"Submitting to queue: {batch_job_queue_name}")
+                  print(f"Job definition: BatchJobDefinition")
+
+                  response = batch.submit_job(
+                      jobName=f'protein-binder-{job_id[:8]}',
+                      jobQueue=batch_job_queue_name,
+                      jobDefinition=os.environ["JOB_DEFINITION_NAME"],
+                      containerOverrides={
+                          "environment": [
+                              {"name": "JOB_ID", "value": job_id},
+                              {"name": "INPUT_BUCKET", "value": bucketName},
+                              {"name": "INPUT_KEY", "value": inputFileName},
+                              {"name": "PDB_NAME", "value": pdb_name},
+                              {"name": "JOBS_TABLE_NAME", "value": os.environ["JOBS_TABLE_NAME"]}
+                          ]
+                      }
+                  )
+
+                  print(f"Batch response: {json.dumps(response, indent=2)}")
+                  print(f"Job submitted: {job_id} for PDB: {pdb_name} -> Batch Job ID: {response['jobId']}")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'job_id': job_id,
+                          'pdb_name': pdb_name,
+                          'batch_job_id': response['jobId']
+                      })
+                  }
+              except Exception as e:
+                  print(f"ERROR: {str(e)}")
+                  print(f"Exception type: {type(e).__name__}")
+                  import traceback
+                  print(f"Traceback: {traceback.format_exc()}")
+                  raise
+  BatchProcessRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${StackName}-repository
+
+  ProteinJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${StackName}-jobs
+      AttributeDefinitions:
+        -
+          AttributeName: "job_id"
+          AttributeType: "S"
+        -
+          AttributeName: "status"
+          AttributeType: "S"
+        -
+          AttributeName: "submitted_at"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "job_id"
+          KeyType: "HASH"
+      GlobalSecondaryIndexes:
+        -
+          IndexName: "StatusIndex"
+          KeySchema:
+            -
+              AttributeName: "status"
+              KeyType: "HASH"
+            -
+              AttributeName: "submitted_at"
+              KeyType: "RANGE"
+          Projection:
+            ProjectionType: "ALL"
+      BillingMode: PAY_PER_REQUEST
+
+  #### VPC Endpoints
+  S3VPCEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName:
+        !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref VPC
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:*'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Sub "${StackName}-${AWS::AccountId}"
+
+  DynamoDBVPCEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      RouteTableIds:
+        - !Ref PrivateSubnetRouteTable
+      ServiceName:
+        !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcId: !Ref VPC
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal: '*'
+          Action:
+            - 'dynamodb:*'
+          Resource:
+            - !Join
+              - ''
+              - - 'arn:aws:dynamodb:'
+                - !Sub "${AWS::Region}:${AWS::AccountId}:table/${StackName}-jobs"
+
+  EcrApiVPCEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName:
+        !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      VpcId: !Ref VPC
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 'ecr:*'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:ecr:'
+                  - !Sub "${AWS::Region}:${AWS::AccountId}:repository/${StackName}"
+
+  EcrDkrVPCEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName:
+        !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      VpcId: !Ref VPC
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 'ecr:*'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:ecr:'
+                  - !Sub "${AWS::Region}:${AWS::AccountId}:repository/${StackName}"
+
+Outputs:
+  ComputeEnvironmentArn:
+    Value:
+      Ref: ComputeEnvironment
+  BatchProcessingJobQueueArn:
+    Value:
+      Ref: BatchProcessingJobQueue
+  BatchProcessingJobDefinitionArn:
+    Value:
+      Ref: BatchProcessingJobDefinition
+  BucketName:
+    Value:
+      Ref: BatchProcessS3Bucket
+  LambdaName:
+    Value:
+      Ref: BatchProcessingLambdaInvokeFunction
